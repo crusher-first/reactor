@@ -1,0 +1,34 @@
+# Build
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+CMakeSettings.json
+
+# Logs
+logs/
+*.log
+
+# Temp
+*.tmp
+*.bak
+.DS_Store
+
+# Test files
+test_*.bin
+www/test_*.bin
+
+# System
+core
+core.*
+.vagrant/

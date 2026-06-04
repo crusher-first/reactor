@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>High-Performance Web Server</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+        }
+        .container {
+            text-align: center;
+            padding: 3rem;
+        }
+        h1 {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            background: linear-gradient(90deg, #00d9ff, #00ff88);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-top: 3rem;
+            max-width: 800px;
+        }
+        .feature {
+            background: rgba(255,255,255,0.1);
+            padding: 1.5rem;
+            border-radius: 12px;
+            backdrop-filter: blur(10px);
+        }
+        .feature h3 {
+            color: #00d9ff;
+            margin-bottom: 0.5rem;
+        }
+        .status {
+            margin-top: 2rem;
+            color: #00ff88;
+            font-size: 1.2rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>High-Performance Web Server</h1>
+        <p>A C++ Web Server powered by io_uring & Zero-Copy</p>
+        <div class="features">
+            <div class="feature">
+                <h3>io_uring</h3>
+                <p>Async I/O Engine</p>
+            </div>
+            <div class="feature">
+                <h3>Zero-Copy</h3>
+                <p>sendfile() Transfer</p>
+            </div>
+            <div class="feature">
+                <h3>Memory Pool</h3>
+                <p>Custom Allocator</p>
+            </div>
+            <div class="feature">
+                <h3>Thread Pool</h3>
+                <p>Worker Threads</p>
+            </div>
+        </div>
+        <div class="status">Server Running Successfully!</div>
+    </div>
+</body>
+</html>

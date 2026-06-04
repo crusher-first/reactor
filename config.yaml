@@ -1,0 +1,36 @@
+# High-Performance Web Server Configuration
+
+server:
+  port: 8080
+  workers: 4
+  uring_depth: 8192
+  timeout: 30000
+  backlog: 65535
+
+memory:
+  buffer_size: 4096
+  pool_size: 1000
+  page_size: 2048
+
+static:
+  directory: ./www
+  cache_size: 100
+  cache_timeout: 300000
+  max_file_size: 104857600  # 100MB
+
+logging:
+  level: info  # debug, info, warn, error
+  file: ./logs/server.log
+  max_size: 104857600  # 100MB per file
+  max_files: 10
+
+connection:
+  max_keepalive: 100
+  max_request_size: 10485760  # 10MB
+  tcp_nodelay: true
+  tcp_quickack: true
+
+performance:
+  cpu_affinity: true
+  worker_cpu_mask: "0-3"
+  glibc_malloc_arena_max: 1

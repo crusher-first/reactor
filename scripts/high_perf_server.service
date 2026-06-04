@@ -1,0 +1,37 @@
+[Unit]
+Description=High-Performance C++ Web Server
+Documentation=https://github.com/crusher-first/reactor
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/high_perf_server
+ExecStart=/opt/high_perf_server/server \
+    --port 8080 \
+    --threads 4 \
+    --queue-depth 8192 \
+    --root /opt/high_perf_server/www
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1000000
+LimitNPROC=65535
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=high_perf_server
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/high_perf_server/www /var/log/high_perf_server
+
+[Install]
+WantedBy=multi-user.target
