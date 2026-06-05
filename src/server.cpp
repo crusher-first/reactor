@@ -218,6 +218,8 @@ bool IOURingServer::parse_request(std::shared_ptr<ConnectionContext> conn) {
         const char* line_end = strstr(p, "\r\n");
         if (colon && line_end && colon < line_end) {
             std::string key(p, colon - p);
+            // HTTP header 名大小写不敏感，统一转小写
+            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
             // 跳过 ": "
             std::string value(colon + 2, line_end - colon - 2);
             conn->request.headers[key] = value;
@@ -233,7 +235,7 @@ void IOURingServer::process_request(std::shared_ptr<ConnectionContext> conn) {
     const std::string& method = conn->request.method;
 
     // 检查 Connection 头
-    auto it = conn->request.headers.find("Connection");
+    auto it = conn->request.headers.find("connection");
     if (it != conn->request.headers.end()) {
         conn->keep_alive = (it->second.find("keep-alive") != std::string::npos);
     } else {
@@ -249,8 +251,20 @@ void IOURingServer::process_request(std::shared_ptr<ConnectionContext> conn) {
             file_path += path;
         }
 
-        // 安全检查：防止路径遍历
-        if (file_path.find("..") != std::string::npos) {
+        // 安全检查：规范化路径防止路径遍历攻击
+        char real_path[PATH_MAX];
+        if (realpath(file_path.c_str(), real_path) == nullptr) {
+            send_error(conn, 400, "Bad Request");
+            return;
+        }
+        std::string resolved_path(real_path);
+        char root_buf[PATH_MAX];
+        if (realpath(config_.root_dir.c_str(), root_buf) == nullptr) {
+            send_error(conn, 500, "Internal Error");
+            return;
+        }
+        std::string root_real(root_buf);
+        if (resolved_path.compare(0, root_real.size(), root_real) != 0) {
             send_error(conn, 403, "Forbidden");
             return;
         }
@@ -295,8 +309,10 @@ void IOURingServer::send_error(std::shared_ptr<ConnectionContext> conn,
     std::string header = ZeroCopyFileTransfer::build_response_header(
         status, message, body.size(), "text/html", false);
 
-    ::write(conn->fd, header.data(), header.size());
-    ::write(conn->fd, body.data(), body.size());
+    ssize_t hw = ::write(conn->fd, header.data(), header.size());
+    if (hw > 0) {
+        ::write(conn->fd, body.data(), body.size());
+    }
 
     conn_manager_->close_connection(conn);
 }

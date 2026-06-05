@@ -158,13 +158,15 @@ T* MemoryPool<T>::allocate() {
     }
 
     // 需要分配新的块
-    T* block = static_cast<T*>(::operator new(block_size_ * sizeof(T)));
+    void* raw = ::operator new(block_size_ * sizeof(T));
+    T* block = static_cast<T*>(raw);
     blocks_.push_back(block);
 
     // 第一个对象返回，其余加入空闲链表
-    T* first = block;
+    T* first = new (block) T();
     for (size_t i = 1; i < block_size_; ++i) {
-        free_list_.push_back(block + i);
+        T* obj = new (block + i) T();
+            free_list_.push_back(obj);
     }
     return first;
 }
@@ -184,7 +186,8 @@ void MemoryPool<T>::preallocate(size_t count) {
         blocks_.push_back(block);
 
         for (size_t i = 0; i < block_size_; ++i) {
-            free_list_.push_back(block + i);
+            T* obj = new (block + i) T();
+            free_list_.push_back(obj);
         }
     }
 }
