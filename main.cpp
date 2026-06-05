@@ -12,11 +12,11 @@ using namespace high_perf;
 // 全局服务器实例（用于信号处理）
 static std::unique_ptr<IOURingServer> g_server;
 
+static volatile sig_atomic_t g_stop_requested = 0;
+
 static void signal_handler(int sig) {
     (void)sig;
-    if (g_server) {
-        g_server->stop();
-    }
+    g_stop_requested = 1;
 }
 
 static void print_usage(const char* prog) {
@@ -99,7 +99,9 @@ int main(int argc, char* argv[]) {
 
     // 启动服务器
     try {
-        g_server->start();
+        while (!g_stop_requested) {
+            g_server->start();
+        }
     } catch (const std::exception& e) {
         std::cerr << "Server error: " << e.what() << std::endl;
         return 1;
