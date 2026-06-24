@@ -8,6 +8,10 @@
 #include "zero_copy.hpp"
 #include <iostream>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
+#include <limits.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -130,29 +134,31 @@ void IOURingServer::event_loop() {
 }
 
 void IOURingServer::accept_connections() {
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
+    while (true) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
 
-    int client_fd = ::accept(server_fd_, (struct sockaddr*)&client_addr, &addr_len);
-    if (client_fd < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            std::cerr << "Accept error: " << strerror(errno) << std::endl;
+        int client_fd = ::accept(server_fd_, (struct sockaddr*)&client_addr, &addr_len);
+        if (client_fd < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                std::cerr << "Accept error: " << strerror(errno) << std::endl;
+            }
+            return;
         }
-        return;
+
+        // 设置为非阻塞
+        int flags = fcntl(client_fd, F_GETFL, 0);
+        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+        // 创建连接
+        auto conn = conn_manager_->create_connection(client_fd);
+
+        // 更新活跃时间
+        conn_manager_->touch_connection(conn);
+
+        // 处理请求
+        handle_request(conn);
     }
-
-    // 设置为非阻塞
-    int flags = fcntl(client_fd, F_GETFL, 0);
-    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-
-    // 创建连接
-    auto conn = conn_manager_->create_connection(client_fd);
-
-    // 更新活跃时间
-    conn_manager_->touch_connection(conn);
-
-    // 处理请求
-    handle_request(conn);
 }
 
 void IOURingServer::handle_request(std::shared_ptr<ConnectionContext> conn) {
@@ -165,6 +171,8 @@ void IOURingServer::handle_request(std::shared_ptr<ConnectionContext> conn) {
     ssize_t n = ::read(conn->fd, buf->data(), buf->capacity() - 1);
     if (n > 0) {
         buf->resize(static_cast<size_t>(n));
+        // 确保 buffer 以 null 结尾，供 strstr/sscanf 等字符串函数使用
+        buf->data()[n] = '\0';
         conn_manager_->touch_connection(conn);
 
         // 解析请求
@@ -188,7 +196,6 @@ bool IOURingServer::parse_request(std::shared_ptr<ConnectionContext> conn) {
 
     // 简单的 HTTP 请求解析
     const char* data = buf->data();
-    size_t len = buf->size();
 
     // 查找请求行结束
     const char* end = strstr(data, "\r\n");
@@ -234,13 +241,9 @@ void IOURingServer::process_request(std::shared_ptr<ConnectionContext> conn) {
     const std::string& path = conn->request.path;
     const std::string& method = conn->request.method;
 
-    // 检查 Connection 头
-    auto it = conn->request.headers.find("connection");
-    if (it != conn->request.headers.end()) {
-        conn->keep_alive = (it->second.find("keep-alive") != std::string::npos);
-    } else {
-        conn->keep_alive = (conn->request.version == "HTTP/1.1");
-    }
+    // 当前事件循环不支持对 keep-alive 连接的后续请求重新读数据，
+    // 因此强制关闭连接以避免客户端挂起等待
+    conn->keep_alive = false;
 
     // 处理静态文件
     if (method == "GET") {
@@ -254,7 +257,12 @@ void IOURingServer::process_request(std::shared_ptr<ConnectionContext> conn) {
         // 安全检查：规范化路径防止路径遍历攻击
         char real_path[PATH_MAX];
         if (realpath(file_path.c_str(), real_path) == nullptr) {
-            send_error(conn, 400, "Bad Request");
+            // 文件不存在返回 404，其他错误返回 400
+            if (errno == ENOENT || errno == ENOTDIR) {
+                send_error(conn, 404, "Not Found");
+            } else {
+                send_error(conn, 400, "Bad Request");
+            }
             return;
         }
         std::string resolved_path(real_path);
@@ -311,7 +319,8 @@ void IOURingServer::send_error(std::shared_ptr<ConnectionContext> conn,
 
     ssize_t hw = ::write(conn->fd, header.data(), header.size());
     if (hw > 0) {
-        ::write(conn->fd, body.data(), body.size());
+        ssize_t bw = ::write(conn->fd, body.data(), body.size());
+        (void)bw;
     }
 
     conn_manager_->close_connection(conn);

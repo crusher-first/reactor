@@ -9,6 +9,10 @@
 #include "timer.hpp"
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <unordered_map>
+#include <functional>
+#include <memory>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <fcntl.h>

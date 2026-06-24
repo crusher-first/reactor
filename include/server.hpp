@@ -14,6 +14,8 @@
 #include <thread>
 #include <vector>
 #include <functional>
+#include <condition_variable>
+#include <mutex>
 
 namespace high_perf {
 

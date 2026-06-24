@@ -140,11 +140,12 @@ inline ssize_t ZeroCopyFileTransfer::sendfile(int client_fd, const std::string& 
     }
 
     // 使用 sendfile 零拷贝传输
+    // sendfile(out_fd, in_fd, &offset, count) - out_fd=socket, in_fd=file
     off_t offset = 0;
     ssize_t total = 0;
 
     while (offset < st.st_size) {
-        ssize_t n = ::sendfile(file_fd, client_fd, offset, st.st_size - offset);
+        ssize_t n = ::sendfile(client_fd, file_fd, &offset, st.st_size - offset);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN) {
                 continue;
@@ -154,7 +155,6 @@ inline ssize_t ZeroCopyFileTransfer::sendfile(int client_fd, const std::string& 
         if (n == 0) {
             break;
         }
-        offset += n;
         total += n;
     }
 
@@ -174,7 +174,8 @@ inline ssize_t ZeroCopyFileTransfer::sendfile_range(
 
     ssize_t total = 0;
     while (length > 0) {
-        ssize_t n = ::sendfile(file_fd, client_fd, offset, length);
+        // sendfile(out_fd, in_fd, &offset, count) - out_fd=socket, in_fd=file
+        ssize_t n = ::sendfile(client_fd, file_fd, &offset, length);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN) {
                 continue;
@@ -184,7 +185,6 @@ inline ssize_t ZeroCopyFileTransfer::sendfile_range(
         if (n == 0) {
             break;
         }
-        offset += n;
         length -= n;
         total += n;
     }
@@ -200,21 +200,25 @@ inline bool ZeroCopyFileTransfer::file_exists(const std::string& path) const {
 inline /* static */ const char* ZeroCopyFileTransfer::get_mime_type(
     const std::string& path
 ) {
-    if (path.ends_with(".html") || path.ends_with(".htm")) return "text/html";
-    if (path.ends_with(".css")) return "text/css";
-    if (path.ends_with(".js")) return "application/javascript";
-    if (path.ends_with(".json")) return "application/json";
-    if (path.ends_with(".xml")) return "application/xml";
-    if (path.ends_with(".png")) return "image/png";
-    if (path.ends_with(".jpg") || path.ends_with(".jpeg")) return "image/jpeg";
-    if (path.ends_with(".gif")) return "image/gif";
-    if (path.ends_with(".svg")) return "image/svg+xml";
-    if (path.ends_with(".ico")) return "image/x-icon";
-    if (path.ends_with(".pdf")) return "application/pdf";
-    if (path.ends_with(".zip")) return "application/zip";
-    if (path.ends_with(".txt")) return "text/plain";
-    if (path.ends_with(".woff")) return "font/woff";
-    if (path.ends_with(".woff2")) return "font/woff2";
+    auto ends_with = [](const std::string& s, const char* suffix) {
+        size_t slen = strlen(suffix);
+        return s.size() >= slen && s.compare(s.size() - slen, slen, suffix) == 0;
+    };
+    if (ends_with(path, ".html") || ends_with(path, ".htm")) return "text/html";
+    if (ends_with(path, ".css")) return "text/css";
+    if (ends_with(path, ".js")) return "application/javascript";
+    if (ends_with(path, ".json")) return "application/json";
+    if (ends_with(path, ".xml")) return "application/xml";
+    if (ends_with(path, ".png")) return "image/png";
+    if (ends_with(path, ".jpg") || ends_with(path, ".jpeg")) return "image/jpeg";
+    if (ends_with(path, ".gif")) return "image/gif";
+    if (ends_with(path, ".svg")) return "image/svg+xml";
+    if (ends_with(path, ".ico")) return "image/x-icon";
+    if (ends_with(path, ".pdf")) return "application/pdf";
+    if (ends_with(path, ".zip")) return "application/zip";
+    if (ends_with(path, ".txt")) return "text/plain";
+    if (ends_with(path, ".woff")) return "font/woff";
+    if (ends_with(path, ".woff2")) return "font/woff2";
     return "application/octet-stream";
 }
 
