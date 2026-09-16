@@ -304,7 +304,7 @@ inline TimingWheel::TimingWheel(int64_t tick_ms, size_t wheel_size, int64_t max_
     : tick_ms_(tick_ms)
     , wheel_size_(wheel_size)
     , max_timeout_(max_timeout)
-    , current_time_(current_time_ms())
+    , current_time_(MinHeapTimer::current_time_ms())
     , slots_(wheel_size, nullptr) {}
 
 inline uint64_t TimingWheel::add_timer(int64_t timeout_ms, TimerCallback callback) {

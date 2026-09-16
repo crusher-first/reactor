@@ -37,6 +37,14 @@ target_link_libraries(server PRIVATE
     pthread
 )
 
+# epoll 对照组可执行文件
+add_executable(server_epoll main_epoll.cpp src/epoll_server.cpp)
+target_compile_options(server_epoll PRIVATE
+    -Wall -Wextra -Wno-unused-parameter
+    -O3 -march=native
+)
+target_link_libraries(server_epoll PRIVATE pthread)
+
 target_link_options(server PRIVATE -O3 -Wl,-rpath,.)
 
 # 安装

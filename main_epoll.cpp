@@ -1,9 +1,8 @@
-#include "server.hpp"
+#include "epoll_server.hpp"
 #include <iostream>
 #include <csignal>
 #include <getopt.h>
 using namespace high_perf;
-class EpollServer;
 static EpollServer* gs = nullptr;
 static void sh(int) { if (gs) gs->stop(); }
 int main(int argc, char* argv[]) {
