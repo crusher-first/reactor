@@ -17,6 +17,9 @@ static volatile sig_atomic_t g_stop_requested = 0;
 static void signal_handler(int sig) {
     (void)sig;
     g_stop_requested = 1;
+    if (g_server) {
+        g_server->stop();
+    }
 }
 
 static void print_usage(const char* prog) {

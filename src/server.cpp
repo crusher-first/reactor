@@ -1,43 +1,55 @@
 /**
  * @file server.cpp
- * @brief 高性能 Web 服务器主实现
+ * @brief 高性能 Web 服务器主实现（基于 io_uring 的原生异步 I/O）
  */
 #include "server.hpp"
-#include "io_uring_wrapper.hpp"
-#include "connection.hpp"
 #include "zero_copy.hpp"
+
 #include <iostream>
 #include <cstring>
+#include <cerrno>
+#include <cctype>
+#include <algorithm>
+#include <limits.h>
+
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 namespace high_perf {
 
+// ---- 完成事件 user_data 编码：高 32 位为 tag，低 32 位为 fd / slot 索引 ----
+static constexpr uint64_t TAG_ACCEPT = 1;
+static constexpr uint64_t TAG_RECV   = 2;
+static constexpr uint64_t TAG_SEND   = 3;
+
+static inline uint64_t make_user_data(uint64_t tag, uint32_t val) {
+    return (tag << 32) | static_cast<uint64_t>(val);
+}
+
+static constexpr size_t MAX_REQUEST_BYTES = 64 * 1024;
+static constexpr size_t ACCEPT_SLOTS = 64;
+
 IOURingServer::IOURingServer(const ServerConfig& config)
     : config_(config)
-    , running_(false)
     , server_fd_(-1)
-    , stop_eventfd_(-1)
 {
-    // 忽略 SIGPIPE
+    // 忽略 SIGPIPE，避免向已关闭 socket 写入导致进程退出
     signal(SIGPIPE, SIG_IGN);
+    memset(&ring_, 0, sizeof(ring_));
 }
 
 IOURingServer::~IOURingServer() {
     stop();
+    cleanup();
 }
 
 bool IOURingServer::init() {
-    // 创建 io_uring 实例
-    ring_ = std::make_unique<IOURing>(config_.queue_depth);
-    if (!ring_->good()) {
-        std::cerr << "Failed to initialize io_uring" << std::endl;
-        return false;
-    }
-
     // 创建服务器 socket
     server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd_ < 0) {
@@ -45,11 +57,9 @@ bool IOURingServer::init() {
         return false;
     }
 
-    // 设置 SO_REUSEADDR
     int opt = 1;
     setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // 绑定地址
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -61,32 +71,36 @@ bool IOURingServer::init() {
         return false;
     }
 
-    // 监听
     if (listen(server_fd_, config_.backlog) < 0) {
         std::cerr << "Failed to listen: " << strerror(errno) << std::endl;
         return false;
     }
 
-    // 设置为非阻塞
+    // 监听 socket 设为非阻塞（io_uring 自身会处理非阻塞 I/O）
     int flags = fcntl(server_fd_, F_GETFL, 0);
     fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK);
 
-    // 创建连接管理器
-    conn_manager_ = std::make_unique<ConnectionManager>();
-    conn_manager_->set_close_callback([this](int fd) {
-        ring_->close(fd, nullptr);
-    });
+    // 初始化 io_uring（默认参数，非 SQPOLL）
+    if (io_uring_queue_init(config_.queue_depth, &ring_, 0) < 0) {
+        std::cerr << "Failed to init io_uring: " << strerror(errno) << std::endl;
+        return false;
+    }
+    ring_ready_ = true;
 
-    // 创建文件传输器
+    // 计算静态文件根目录的规范路径（用于路径遍历防护）
+    char root_buf[PATH_MAX];
+    if (realpath(config_.root_dir.c_str(), root_buf) != nullptr) {
+        root_real_ = root_buf;
+    }
+
+    accept_slots_.resize(ACCEPT_SLOTS);
+    accept_in_flight_.assign(ACCEPT_SLOTS, false);
+
     file_transfer_ = std::make_unique<ZeroCopyFileTransfer>(config_.file_cache_size);
 
-    // 创建线程池
-    thread_pool_ = std::make_unique<ThreadPool>(config_.worker_threads);
-
-    // 创建定时器
-    timer_ = std::make_unique<MinHeapTimer>();
-
-    std::cout << "Server initialized on port " << config_.port << std::endl;
+    std::cout << "Server initialized on port " << config_.port
+              << " (io_uring, queue_depth=" << config_.queue_depth << ")"
+              << std::endl;
     return true;
 }
 
@@ -96,13 +110,7 @@ void IOURingServer::start() {
     }
 
     running_ = true;
-
-    // 注册 accept
-    accept_connections();
-
-    // 启动事件循环
     event_loop();
-
     running_ = false;
     cleanup();
 }
@@ -111,195 +119,310 @@ void IOURingServer::stop() {
     running_ = false;
 }
 
+void IOURingServer::cleanup() {
+    if (server_fd_ >= 0) {
+        ::close(server_fd_);
+        server_fd_ = -1;
+    }
+    // 先关闭所有连接，再销毁 io_uring（其 CQE 可能引用连接对象）
+    for (auto& kv : conns_) {
+        if (kv.second && kv.second->fd >= 0) {
+            ::close(kv.second->fd);
+        }
+    }
+    conns_.clear();
+    if (ring_ready_) {
+        io_uring_queue_exit(&ring_);
+        ring_ready_ = false;
+    }
+    std::cout << "Server stopped" << std::endl;
+}
+
+struct io_uring_sqe* IOURingServer::get_sqe() {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (!sqe) {
+        // 提交队列已满：先提交一次，再尝试取 SQE
+        io_uring_submit(&ring_);
+        sqe = io_uring_get_sqe(&ring_);
+    }
+    return sqe;
+}
+
 void IOURingServer::event_loop() {
     while (running_) {
-        // 处理定时器
-        timer_->tick();
-
-        // 处理 io_uring 完成事件
-        int processed = ring_->process_completions(64);
-
-        // 如果没有事件，短暂等待
-        if (processed == 0) {
-            usleep(1000); // 1ms
+        // 补充 accept 请求
+        for (size_t i = 0; i < accept_slots_.size(); ++i) {
+            if (!accept_in_flight_[i]) {
+                submit_accept(i);
+            }
         }
 
-        // 定期提交 accept
-        accept_connections();
+        // 提交挂起的 SQE
+        io_uring_submit(&ring_);
+
+        // 等待至少一个完成事件（1 秒超时，保证 stop() 能及时退出）
+        struct io_uring_cqe* cqe = nullptr;
+        struct __kernel_timespec ts{};
+        ts.tv_sec = 1;
+        ts.tv_nsec = 0;
+        io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+
+        // 处理所有就绪的完成事件
+        drain_completions();
     }
 }
 
-void IOURingServer::accept_connections() {
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
+void IOURingServer::drain_completions() {
+    unsigned head = 0;
+    unsigned count = 0;
+    struct io_uring_cqe* cqe = nullptr;
 
-    int client_fd = ::accept(server_fd_, (struct sockaddr*)&client_addr, &addr_len);
-    if (client_fd < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            std::cerr << "Accept error: " << strerror(errno) << std::endl;
-        }
-        return;
+    io_uring_for_each_cqe(&ring_, head, cqe) {
+        handle_completion(cqe);
+        ++count;
     }
+    io_uring_cq_advance(&ring_, count);
+}
 
-    // 设置为非阻塞
+void IOURingServer::handle_completion(struct io_uring_cqe* cqe) {
+    uint64_t ud = static_cast<uint64_t>(cqe->user_data);
+    uint64_t tag = ud >> 32;
+    uint32_t val = static_cast<uint32_t>(ud & 0xffffffffu);
+    int res = cqe->res;
+
+    switch (tag) {
+    case TAG_ACCEPT: {
+        accept_in_flight_[val] = false;
+        if (res >= 0) {
+            on_accept(res);
+        }
+        // 立即补充该槽位的 accept
+        submit_accept(val);
+        break;
+    }
+    case TAG_RECV: {
+        auto it = conns_.find(static_cast<int>(val));
+        if (it != conns_.end()) {
+            on_recv(it->second.get(), res);
+        }
+        break;
+    }
+    case TAG_SEND: {
+        auto it = conns_.find(static_cast<int>(val));
+        if (it != conns_.end()) {
+            on_send(it->second.get(), res);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void IOURingServer::submit_accept(size_t slot) {
+    if (slot >= accept_slots_.size()) return;
+
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+
+    AcceptSlot& s = accept_slots_[slot];
+    io_uring_prep_accept(sqe, server_fd_, reinterpret_cast<struct sockaddr*>(&s.addr),
+                         &s.addrlen, 0);
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(
+        static_cast<uintptr_t>(make_user_data(TAG_ACCEPT, static_cast<uint32_t>(slot)))));
+    accept_in_flight_[slot] = true;
+}
+
+void IOURingServer::on_accept(int client_fd) {
+    // 客户端 socket 默认独立，需显式设为非阻塞
     int flags = fcntl(client_fd, F_GETFL, 0);
     fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
 
-    // 创建连接
-    auto conn = conn_manager_->create_connection(client_fd);
+    // 关闭 Nagle，避免头部/文件正文分两次发送时引入 ~40ms 延迟
+    int nodelay = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-    // 更新活跃时间
-    conn_manager_->touch_connection(conn);
-
-    // 处理请求
-    handle_request(conn);
+    auto conn = std::make_unique<HttpConn>();
+    conn->fd = client_fd;
+    conns_[client_fd] = std::move(conn);
+    arm_recv(conns_[client_fd].get());
 }
 
-void IOURingServer::handle_request(std::shared_ptr<ConnectionContext> conn) {
-    // 提交异步读
-    Buffer* buf = conn->read_buffer.get();
-    if (!buf) return;
-
-    buf->reserve(config_.buffer_size);
-
-    ssize_t n = ::read(conn->fd, buf->data(), buf->capacity() - 1);
-    if (n > 0) {
-        buf->resize(static_cast<size_t>(n));
-        conn_manager_->touch_connection(conn);
-
-        // 解析请求
-        if (parse_request(conn)) {
-            // 处理请求
-            process_request(conn);
-        }
-    } else if (n == 0) {
-        // 客户端关闭连接
-        conn_manager_->close_connection(conn);
-    } else {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            conn_manager_->close_connection(conn);
-        }
+void IOURingServer::arm_recv(HttpConn* c) {
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) {
+        close_conn(c->fd);
+        return;
     }
+    io_uring_prep_recv(sqe, c->fd, c->recv_buf, sizeof(c->recv_buf), 0);
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(
+        static_cast<uintptr_t>(make_user_data(TAG_RECV, static_cast<uint32_t>(c->fd)))));
 }
 
-bool IOURingServer::parse_request(std::shared_ptr<ConnectionContext> conn) {
-    Buffer* buf = conn->read_buffer.get();
-    if (!buf || buf->size() == 0) return false;
+void IOURingServer::on_recv(HttpConn* c, int res) {
+    if (res <= 0) {
+        // 0 = 对端关闭；< 0 = 错误
+        close_conn(c->fd);
+        return;
+    }
+    c->in.append(c->recv_buf, static_cast<size_t>(res));
+    process_input(c);
+}
 
-    // 简单的 HTTP 请求解析
-    const char* data = buf->data();
-    size_t len = buf->size();
-
-    // 查找请求行结束
-    const char* end = strstr(data, "\r\n");
-    if (!end) return false;
-
-    // 解析请求行: GET /path HTTP/1.1
-    int n = sscanf(data, "%255s %255s %255s",
-                   request_line_.method,
-                   request_line_.path,
-                   request_line_.version);
-    if (n != 3) return false;
-
-    // 解析头部
-    const char* header_start = end + 2;
-    const char* header_end = strstr(header_start, "\r\n\r\n");
-    if (!header_end) return false;
-
-    conn->request.clear();
-    conn->request.method = request_line_.method;
-    conn->request.path = request_line_.path;
-    conn->request.version = request_line_.version;
-
-    // 简单解析头部
-    const char* p = header_start;
-    while (p < header_end) {
-        const char* colon = strchr(p, ':');
-        const char* line_end = strstr(p, "\r\n");
-        if (colon && line_end && colon < line_end) {
-            std::string key(p, colon - p);
-            // HTTP header 名大小写不敏感，统一转小写
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-            // 跳过 ": "
-            std::string value(colon + 2, line_end - colon - 2);
-            conn->request.headers[key] = value;
+void IOURingServer::process_input(HttpConn* c) {
+    size_t pos = c->in.find("\r\n\r\n");
+    if (pos == std::string::npos) {
+        if (c->in.size() > MAX_REQUEST_BYTES) {
+            send_error(c, 431, "Request Header Fields Too Large");
+            return;
         }
-        p = line_end + 2;
+        arm_recv(c);  // 继续读取更多数据
+        return;
+    }
+
+    std::string head = c->in.substr(0, pos + 4);
+    c->in.erase(0, pos + 4);  // 消费当前请求，保留可能的 pipeline 数据
+
+    if (!parse_request(c, head)) {
+        send_error(c, 400, "Bad Request");
+        return;
+    }
+    serve(c);
+}
+
+bool IOURingServer::parse_request(HttpConn* c, const std::string& head) {
+    size_t line_end = head.find("\r\n");
+    if (line_end == std::string::npos) return false;
+
+    std::string line = head.substr(0, line_end);
+
+    // 解析请求行: METHOD SP PATH SP VERSION
+    size_t sp1 = line.find(' ');
+    if (sp1 == std::string::npos) return false;
+    size_t sp2 = line.find(' ', sp1 + 1);
+    if (sp2 == std::string::npos) return false;
+
+    c->method = line.substr(0, sp1);
+    c->path = line.substr(sp1 + 1, sp2 - sp1 - 1);
+    c->version = line.substr(sp2 + 1);
+
+    if (c->method.empty() || c->path.empty() || c->version.empty()) return false;
+
+    // HTTP/1.1 默认 keep-alive，HTTP/1.0 默认关闭
+    c->keep_alive = (c->version == "HTTP/1.1");
+
+    // 解析头部（大小写不敏感）
+    size_t pos = line_end + 2;
+    while (pos < head.size()) {
+        size_t nl = head.find("\r\n", pos);
+        if (nl == std::string::npos) break;
+        std::string hdr = head.substr(pos, nl - pos);
+        size_t colon = hdr.find(':');
+        if (colon != std::string::npos) {
+            std::string key = hdr.substr(0, colon);
+            std::string value = hdr.substr(colon + 1);
+            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            // 去除 value 前导空格
+            size_t nsp = value.find_first_not_of(" \t");
+            if (nsp != std::string::npos) value = value.substr(nsp);
+
+            if (key == "connection") {
+                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+                if (value.find("close") != std::string::npos) {
+                    c->keep_alive = false;
+                } else if (value.find("keep-alive") != std::string::npos) {
+                    c->keep_alive = true;
+                }
+            }
+        }
+        pos = nl + 2;
     }
 
     return true;
 }
 
-void IOURingServer::process_request(std::shared_ptr<ConnectionContext> conn) {
-    const std::string& path = conn->request.path;
-    const std::string& method = conn->request.method;
+void IOURingServer::serve(HttpConn* c) {
+    if (c->method != "GET") {
+        send_error(c, 405, "Method Not Allowed");
+        return;
+    }
 
-    // 检查 Connection 头
-    auto it = conn->request.headers.find("connection");
-    if (it != conn->request.headers.end()) {
-        conn->keep_alive = (it->second.find("keep-alive") != std::string::npos);
+    std::string file_path = config_.root_dir;
+    if (c->path == "/") {
+        file_path += "/index.html";
     } else {
-        conn->keep_alive = (conn->request.version == "HTTP/1.1");
+        file_path += c->path;
     }
 
-    // 处理静态文件
-    if (method == "GET") {
-        std::string file_path = config_.root_dir;
-        if (path == "/") {
-            file_path += "/index.html";
-        } else {
-            file_path += path;
-        }
-
-        // 安全检查：规范化路径防止路径遍历攻击
-        char real_path[PATH_MAX];
-        if (realpath(file_path.c_str(), real_path) == nullptr) {
-            send_error(conn, 400, "Bad Request");
-            return;
-        }
-        std::string resolved_path(real_path);
-        char root_buf[PATH_MAX];
-        if (realpath(config_.root_dir.c_str(), root_buf) == nullptr) {
-            send_error(conn, 500, "Internal Error");
-            return;
-        }
-        std::string root_real(root_buf);
-        if (resolved_path.compare(0, root_real.size(), root_real) != 0) {
-            send_error(conn, 403, "Forbidden");
-            return;
-        }
-
-        struct stat st;
-        if (stat(file_path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
-            // 发送文件
-            const char* mime = ZeroCopyFileTransfer::get_mime_type(file_path);
-            std::string header = ZeroCopyFileTransfer::build_response_header(
-                200, "OK", st.st_size, mime, conn->keep_alive);
-
-            // 发送头部
-            ssize_t h = ::write(conn->fd, header.data(), header.size());
-            if (h > 0) {
-                // 发送文件内容（零拷贝）
-                ssize_t sent = file_transfer_->sendfile(conn->fd, file_path);
-                (void)sent;
-            }
-
-            if (!conn->keep_alive) {
-                conn_manager_->close_connection(conn);
-            } else {
-                conn->read_buffer->clear();
-                conn_manager_->touch_connection(conn);
-            }
-            return;
-        }
+    // 路径遍历防护：解析到的文件必须位于 root_real_ 之下
+    char real_path[PATH_MAX];
+    if (realpath(file_path.c_str(), real_path) == nullptr) {
+        send_error(c, 404, "Not Found");
+        return;
+    }
+    std::string resolved(real_path);
+    if (!root_real_.empty() && resolved.compare(0, root_real_.size(), root_real_) != 0) {
+        send_error(c, 403, "Forbidden");
+        return;
     }
 
-    // 404
-    send_error(conn, 404, "Not Found");
+    struct stat st;
+    if (stat(file_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+        send_error(c, 404, "Not Found");
+        return;
+    }
+
+    const char* mime = ZeroCopyFileTransfer::get_mime_type(file_path);
+    std::string header = ZeroCopyFileTransfer::build_response_header(
+        200, "OK", static_cast<size_t>(st.st_size), mime, c->keep_alive);
+
+    // 头部先异步发送，文件正文使用零拷贝 sendfile（缓存 fd，告别人工缓冲与重复 open/read/close）
+    c->out = header;
+    c->out_off = 0;
+    c->file_path = file_path;
+    c->send_file_after = true;
+    submit_send(c);
 }
 
-void IOURingServer::send_error(std::shared_ptr<ConnectionContext> conn,
-                                int status, const char* message) {
+void IOURingServer::submit_send(HttpConn* c) {
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) {
+        close_conn(c->fd);
+        return;
+    }
+    const char* data = c->out.data() + c->out_off;
+    size_t len = c->out.size() - c->out_off;
+    io_uring_prep_send(sqe, c->fd, data, len, 0);
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(
+        static_cast<uintptr_t>(make_user_data(TAG_SEND, static_cast<uint32_t>(c->fd)))));
+}
+
+void IOURingServer::on_send(HttpConn* c, int res) {
+    if (res <= 0) {
+        close_conn(c->fd);
+        return;
+    }
+
+    c->out_off += static_cast<size_t>(res);
+    if (c->out_off < c->out.size()) {
+        submit_send(c);  // 继续发送剩余部分
+        return;
+    }
+
+    // 头部已发送完毕，零拷贝发送文件正文（复用缓存 fd）
+    if (c->send_file_after) {
+        c->send_file_after = false;
+        file_transfer_->sendfile(c->fd, c->file_path);
+    }
+
+    if (c->keep_alive) {
+        process_input(c);  // 处理 pipeline 中已到达的请求，或等待下一次 recv
+    } else {
+        close_conn(c->fd);
+    }
+}
+
+void IOURingServer::send_error(HttpConn* c, int status, const char* message) {
     std::string body = "<html><body><h1>";
     body += std::to_string(status);
     body += " ";
@@ -309,22 +432,18 @@ void IOURingServer::send_error(std::shared_ptr<ConnectionContext> conn,
     std::string header = ZeroCopyFileTransfer::build_response_header(
         status, message, body.size(), "text/html", false);
 
-    ssize_t hw = ::write(conn->fd, header.data(), header.size());
-    if (hw > 0) {
-        ::write(conn->fd, body.data(), body.size());
-    }
-
-    conn_manager_->close_connection(conn);
+    c->out = header + body;
+    c->out_off = 0;
+    c->keep_alive = false;
+    c->send_file_after = false;
+    submit_send(c);
 }
 
-void IOURingServer::cleanup() {
-    if (server_fd_ >= 0) {
-        ::close(server_fd_);
-        server_fd_ = -1;
-    }
-    conn_manager_.reset();
-    ring_.reset();
-    std::cout << "Server stopped" << std::endl;
+void IOURingServer::close_conn(int fd) {
+    auto it = conns_.find(fd);
+    if (it == conns_.end()) return;
+    conns_.erase(it);
+    ::close(fd);
 }
 
 } // namespace high_perf

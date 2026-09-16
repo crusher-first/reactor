@@ -6,6 +6,7 @@
 #define EPOLL_SERVER_HPP
 
 #include "server.hpp"
+#include "connection.hpp"
 #include <sys/epoll.h>
 #include <cstdint>
 #include <unordered_map>

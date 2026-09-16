@@ -1,21 +1,21 @@
 /**
  * @file server.hpp
- * @brief 高性能 Web 服务器头文件
+ * @brief 高性能 Web 服务器头文件（基于 io_uring）
  */
 #ifndef SERVER_HPP
 #define SERVER_HPP
 
-#include "io_uring_wrapper.hpp"
-#include "connection.hpp"
+#include <liburing.h>
 #include "zero_copy.hpp"
-#include "timer.hpp"
+
+#include <sys/socket.h>
+#include <cstdint>
+#include <cstddef>
+#include <string>
+#include <vector>
+#include <unordered_map>
 #include <memory>
 #include <atomic>
-#include <thread>
-#include <vector>
-#include <functional>
-#include <condition_variable>
-#include <mutex>
 
 namespace high_perf {
 
@@ -25,7 +25,7 @@ namespace high_perf {
 struct ServerConfig {
     int port = 8080;              // 监听端口
     int queue_depth = 256;         // io_uring 队列深度
-    int worker_threads = 4;        // 工作线程数
+    int worker_threads = 4;        // 工作线程数（当前 io_uring 实现为单线程事件循环）
     int backlog = 512;             // listen backlog
     size_t file_cache_size = 100; // 文件缓存数量
     int buffer_size = 8192;        // 缓冲区大小
@@ -34,166 +34,75 @@ struct ServerConfig {
 };
 
 /**
- * @brief 线程池
- */
-class ThreadPool {
-public:
-    explicit ThreadPool(size_t threads);
-    ~ThreadPool();
-
-    /**
-     * @brief 提交任务
-     */
-    template<typename F>
-    void submit(F&& task) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            tasks_.push_back(std::forward<F>(task));
-        }
-        cond_.notify_one();
-    }
-
-    /**
-     * @brief 停止线程池
-     */
-    void stop();
-
-    /**
-     * @brief 等待所有任务完成
-     */
-    void wait_all();
-
-    size_t size() const { return threads_.size(); }
-
-private:
-    void worker_loop();
-
-    std::vector<std::thread> threads_;
-    std::vector<std::function<void()>> tasks_;
-    std::mutex mutex_;
-    std::condition_variable cond_;
-    std::atomic<bool> stop_{false};
-    std::atomic<size_t> active_tasks_{0};
-};
-
-/**
- * @brief 高性能 Web 服务器
+ * @brief 高性能 Web 服务器（基于 io_uring 的原生异步 I/O）
  */
 class IOURingServer {
 public:
     explicit IOURingServer(const ServerConfig& config);
     ~IOURingServer();
 
-    /**
-     * @brief 启动服务器
-     */
     void start();
-
-    /**
-     * @brief 停止服务器
-     */
     void stop();
-
-    /**
-     * @brief 是否正在运行
-     */
     bool running() const { return running_.load(); }
-
-    /**
-     * @brief 获取配置
-     */
     const ServerConfig& config() const { return config_; }
 
 private:
+    struct HttpConn {
+        int fd = -1;
+        std::string in;              // 未处理完毕的请求字节（可能含 pipeline）
+        std::string out;             // 待发送的响应头部
+        size_t out_off = 0;          // 已发送偏移
+        bool keep_alive = true;
+        std::string method, path, version;
+        std::string file_path;       // 头部发送完毕后需零拷贝发送的文件
+        bool send_file_after = false;
+        char recv_buf[4096];
+    };
+
+    struct AcceptSlot {
+        struct sockaddr_storage addr;
+        socklen_t addrlen = sizeof(addr);
+    };
+
     bool init();
-    void event_loop();
-    void accept_connections();
-    void handle_request(std::shared_ptr<ConnectionContext> conn);
-    bool parse_request(std::shared_ptr<ConnectionContext> conn);
-    void process_request(std::shared_ptr<ConnectionContext> conn);
-    void send_error(std::shared_ptr<ConnectionContext> conn, int status, const char* message);
     void cleanup();
 
-    // 临时请求行解析
-    struct {
-        char method[256];
-        char path[256];
-        char version[256];
-    } request_line_;
+    void event_loop();
+    void drain_completions();
+    void handle_completion(struct io_uring_cqe* cqe);
+
+    struct io_uring_sqe* get_sqe();
+
+    void submit_accept(size_t slot);
+    void on_accept(int client_fd);
+
+    void arm_recv(HttpConn* c);
+    void on_recv(HttpConn* c, int res);
+    void process_input(HttpConn* c);
+
+    void submit_send(HttpConn* c);
+    void on_send(HttpConn* c, int res);
+
+    bool parse_request(HttpConn* c, const std::string& head);
+    void serve(HttpConn* c);
+    void send_error(HttpConn* c, int status, const char* message);
+    void close_conn(int fd);
 
     ServerConfig config_;
-    std::atomic<bool> running_;
+    std::atomic<bool> running_{false};
 
-    int server_fd_;
-    int stop_eventfd_;
+    int server_fd_ = -1;
+    struct io_uring ring_;
+    bool ring_ready_ = false;
 
-    std::unique_ptr<IOURing> ring_;
-    std::unique_ptr<ConnectionManager> conn_manager_;
+    std::vector<AcceptSlot> accept_slots_;
+    std::vector<bool> accept_in_flight_;
+    std::unordered_map<int, std::unique_ptr<HttpConn>> conns_;
+
     std::unique_ptr<ZeroCopyFileTransfer> file_transfer_;
-    std::unique_ptr<ThreadPool> thread_pool_;
-    std::unique_ptr<MinHeapTimer> timer_;
+
+    std::string root_real_;
 };
-
-// ==================== ThreadPool 实现 ====================
-
-inline ThreadPool::ThreadPool(size_t threads) {
-    for (size_t i = 0; i < threads; ++i) {
-        threads_.emplace_back(&ThreadPool::worker_loop, this);
-    }
-}
-
-inline ThreadPool::~ThreadPool() {
-    stop();
-}
-
-inline void ThreadPool::worker_loop() {
-    while (!stop_.load()) {
-        std::function<void()> task;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cond_.wait(lock, [this] {
-                return stop_.load() || !tasks_.empty();
-            });
-
-            if (stop_.load() && tasks_.empty()) {
-                return;
-            }
-
-            if (!tasks_.empty()) {
-                task = std::move(tasks_.front());
-                tasks_.erase(tasks_.begin());
-            }
-        }
-
-        if (task) {
-            active_tasks_++;
-            task();
-            active_tasks_--;
-        }
-    }
-}
-
-inline void ThreadPool::stop() {
-    stop_.store(true);
-    cond_.notify_all();
-    for (auto& t : threads_) {
-        if (t.joinable()) {
-            t.join();
-        }
-    }
-}
-
-inline void ThreadPool::wait_all() {
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (tasks_.empty() && active_tasks_.load() == 0) {
-                break;
-            }
-        }
-    }
-}
 
 } // namespace high_perf
 

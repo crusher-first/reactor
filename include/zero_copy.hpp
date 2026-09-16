@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <memory>
+#include "timer.hpp"
 
 namespace high_perf {
 
