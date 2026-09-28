@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 
@@ -164,6 +165,10 @@ void EpollServer::accept_connections() {
 
         int flags = fcntl(client_fd, F_GETFL, 0);
         fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+        // 与 IOURingServer 保持一致的 TCP 配置，保证对比公平
+        int nodelay = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
         auto conn = conn_manager_->create_connection(client_fd);
         conn_manager_->touch_connection(conn);
